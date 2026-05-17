@@ -1,7 +1,7 @@
 #!/bin/bash
 
 driver_path="/data/etc"
-driver_name="dbus-mqtt-solar-charger"
+driver_name="dbus-mqtt-charger"
 
 echo ""
 echo ""

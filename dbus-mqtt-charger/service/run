@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "*** starting dbus-mqtt-charger ***"
+exec 2>&1
+exec python /data/etc/dbus-mqtt-charger/dbus-mqtt-charger.py
