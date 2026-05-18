@@ -4,11 +4,20 @@
 # Bridges an ESPHome-controlled Huawei R4875G1 rectifier (or similar) to Venus
 # OS as a com.victronenergy.charger service.
 #
-# Subscribes to multiple ESPHome MQTT state topics (one per sensor, ESPHome's
-# default behaviour) and publishes the data on dbus. When DVCC is enabled in
-# Venus and writes a new ChargeCurrent / ChargeVoltage setpoint to our
-# /Link/* paths, we publish the value to the ESPHome `.../command` topic so the
-# rectifier follows DVCC.
+# Two-way bridge:
+#   READ:  subscribes to multiple ESPHome MQTT state topics (one per sensor,
+#          ESPHome's default behaviour) and republishes the data on dbus as
+#          a com.victronenergy.charger service.
+#   WRITE: implements DVCC forwarding via Plan B — listens on the SystemBus
+#          for changes to:
+#              com.victronenergy.settings/Settings/SystemSetup/MaxChargeCurrent
+#              com.victronenergy.settings/Settings/SystemSetup/MaxChargeVoltage
+#              com.victronenergy.battery.aggregate/Info/MaxChargeCurrent
+#              com.victronenergy.battery.aggregate/Info/MaxChargeVoltage
+#          On any change, takes min(user, bms) and publishes the resulting
+#          setpoint to ESPHome via the configured command topics. This is
+#          needed because Venus DVCC does not write to /Link/* on
+#          com.victronenergy.charger services (only on solarchargers).
 #
 # Forked from mr-manuel/venus-os_dbus-mqtt-solar-charger.
 
@@ -20,6 +29,7 @@ import os
 from time import sleep, time
 import configparser
 import _thread
+import dbus  # noqa: E402  (full dbus used by DvccForwarder)
 
 # import external packages
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "ext"))
@@ -233,6 +243,280 @@ def on_message(client, userdata, msg):
         logging.error(f"on_message error: {repr(eo)} of type {et} in {etb.tb_frame.f_code.co_filename} line #{etb.tb_lineno}")
 
 
+# ─────────────────────────── DVCC forwarder (Plan B) ───────────────────────────
+class DvccForwarder:
+    """
+    Replicates a small piece of what DVCC does for solarchargers: takes the
+    user-set and BMS-derived charge limits from the Venus SystemBus, picks
+    the minimum, applies safety clamps, and forwards the result to ESPHome
+    via MQTT.
+
+    Why: Venus DVCC does NOT write /Link/ChargeCurrent on services of type
+    com.victronenergy.charger (only on solarchargers and VE.Bus chargers).
+    For a com.victronenergy.charger to follow DVCC limits we have to read
+    the same source-of-truth values ourselves.
+
+    Sources monitored (Venus v3.x):
+      user_ccl: com.victronenergy.settings  /Settings/SystemSetup/MaxChargeCurrent
+      user_cvl: com.victronenergy.settings  /Settings/SystemSetup/MaxChargeVoltage
+      bms_ccl:  com.victronenergy.battery.aggregate  /Info/MaxChargeCurrent
+      bms_cvl:  com.victronenergy.battery.aggregate  /Info/MaxChargeVoltage
+
+    Result: active_ccl = min(user_ccl, bms_ccl), active_cvl = min(user_cvl, bms_cvl)
+    Then clamped to safety limits and published to the ESPHome command topics.
+
+    Updates are signal-driven (PropertiesChanged) with a periodic heartbeat
+    re-evaluation as a fail-safe.
+    """
+
+    def __init__(self, mqtt_client, cmd_topic_ccl, cmd_topic_cvl,
+                 paths, max_current, min_voltage, max_voltage,
+                 mode="load_following",
+                 hysteresis_ccl=1.0, hysteresis_cvl=0.05,
+                 multi_dc_ema_alpha=0.25,
+                 min_publish_interval_s=2.0,
+                 heartbeat_s=30):
+        self._mqtt = mqtt_client
+        self._cmd_ccl = cmd_topic_ccl
+        self._cmd_cvl = cmd_topic_cvl
+        self._max_current = max_current
+        self._min_voltage = min_voltage
+        self._max_voltage = max_voltage
+        self._mode = mode  # 'load_following' or 'simple'
+        self._hysteresis_ccl = hysteresis_ccl
+        self._hysteresis_cvl = hysteresis_cvl
+        # Damping to break the Huawei↔MultiPlus feedback oscillation:
+        # - EMA on multi_dc so we don't react to instant spikes
+        # - min interval between publishes so we don't issue rapid-fire commands
+        self._multi_dc_alpha = multi_dc_ema_alpha   # 0..1, higher = more reactive
+        self._multi_dc_smoothed = None
+        self._min_publish_interval = min_publish_interval_s
+        self._last_publish_time = 0.0
+        self._paths = paths  # list of (key, service, path) tuples
+        self._values = {}    # {key: float or None}
+        self._last_published_ccl = None
+        self._last_published_cvl = None
+        self._bus = dbus.SystemBus()
+        self._setup_subscriptions()
+        # Publish initial state once dbus mainloop is running.
+        # We can call evaluate now; GLib hasn't entered yet but mqtt.publish
+        # is thread-safe and will be queued.
+        self._evaluate_and_publish()
+        if heartbeat_s > 0:
+            GLib.timeout_add_seconds(heartbeat_s, self._heartbeat)
+
+    @staticmethod
+    def _parse(raw):
+        """Parse a dbus value to float or None.
+
+        Venus represents 'not set' values as an empty dbus.Array (`[]`).
+        """
+        try:
+            if isinstance(raw, dbus.Array):
+                if len(raw) == 0:
+                    return None
+                raw = raw[0]
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _setup_subscriptions(self):
+        # Group watched paths by service so we make one ItemsChanged
+        # subscription per service (Victron services emit a single batched
+        # `ItemsChanged` at root `/` rather than per-path PropertiesChanged).
+        services_to_path_to_key = {}  # {service_name: {path: key}}
+        for key, service, path in self._paths:
+            services_to_path_to_key.setdefault(service, {})[path] = key
+            # Initial GET for each watched path
+            try:
+                obj = self._bus.get_object(service, path)
+                raw = obj.GetValue(dbus_interface='com.victronenergy.BusItem')
+                self._values[key] = self._parse(raw)
+                logging.info("DVCC init: %s = %s (from %s%s)",
+                             key, self._values[key], service, path)
+            except Exception as e:
+                self._values[key] = None
+                logging.warning("DVCC init: cannot read %s%s: %s", service, path, e)
+
+        # Subscribe to ItemsChanged at root `/` of each watched service
+        for service, path_to_key in services_to_path_to_key.items():
+            try:
+                self._bus.add_signal_receiver(
+                    handler_function=(lambda items, s=service, p2k=path_to_key:
+                                      self._on_items_changed(s, p2k, items)),
+                    signal_name='ItemsChanged',
+                    dbus_interface='com.victronenergy.BusItem',
+                    bus_name=service,
+                    path='/',
+                )
+                logging.info("DVCC subscribed to ItemsChanged on %s (watching: %s)",
+                             service, list(path_to_key.keys()))
+            except Exception as e:
+                logging.warning("DVCC subscribe failed for %s: %s", service, e)
+
+    def _on_items_changed(self, service, path_to_key, items):
+        """
+        Handler for /ItemsChanged. `items` is a dbus array decoded as a Python
+        dict of the form:
+            {'/Dc/0/Current': {'Value': -10.2, 'Text': '-10.2A'}, ...}
+        We pick out only the paths we care about for this service.
+        """
+        if not isinstance(items, dict):
+            return
+        changed = False
+        for path, fields in items.items():
+            key = path_to_key.get(str(path))
+            if key is None:
+                continue
+            if not isinstance(fields, dict) or 'Value' not in fields:
+                continue
+            new = self._parse(fields['Value'])
+            old = self._values.get(key)
+            if new == old:
+                continue
+            self._values[key] = new
+            logging.info("DVCC change: %s: %s → %s", key, old, new)
+            changed = True
+        if changed:
+            self._evaluate_and_publish()
+
+    def _heartbeat(self):
+        """Periodic re-evaluation + dbus refresh in case a signal was missed
+        or a watched service has restarted."""
+        for key, service, path in self._paths:
+            try:
+                obj = self._bus.get_object(service, path)
+                raw = obj.GetValue(dbus_interface='com.victronenergy.BusItem')
+                v = self._parse(raw)
+                if v != self._values.get(key):
+                    logging.info("DVCC heartbeat refresh: %s: %s → %s",
+                                 key, self._values.get(key), v)
+                    self._values[key] = v
+            except Exception:
+                # Service may be restarting — keep last known value, try again next tick.
+                pass
+        self._evaluate_and_publish()
+        return True  # keep GLib timer alive
+
+    def _evaluate_and_publish(self):
+        """
+        Compute Huawei setpoints and publish to ESPHome.
+
+        ── CCL (current limit) ──
+        target_net_charge = min(user_ccl, bms_ccl)
+            — desired NET current into the battery (Victron convention)
+            — user_ccl=0 means "don't charge", user_ccl=10 means "up to 10 A net into battery"
+
+        mode = 'load_following' (default):
+            Huawei_target = max(0, -multiplus_dc + target_net_charge)
+            — multiplus_dc is signed: + when Multi charges battery, − when Multi inverts
+            — Huawei covers whatever Multi is consuming from DC bus, plus the allowed
+              net charging current. Result: net battery current = target_net_charge,
+              regardless of inverter load.
+
+        mode = 'simple':
+            Huawei_target = target_net_charge
+            — legacy/naïve mode. Use only when there's no MultiPlus or to debug.
+
+        ── CVL (voltage limit) ──
+        active_cvl = min(user_cvl, bms_cvl), clamped to safety window.
+        """
+        user_ccl = self._values.get('user_ccl')
+        bms_ccl  = self._values.get('bms_ccl')
+        user_cvl = self._values.get('user_cvl')
+        bms_cvl  = self._values.get('bms_cvl')
+        multi_dc_raw = self._values.get('multiplus_dc')
+
+        # EMA-smooth multi_dc to damp out short-lived spikes (often caused by
+        # our own setpoint changes inducing transient reactions in Multi).
+        if multi_dc_raw is None:
+            multi_dc = 0.0
+        else:
+            if self._multi_dc_smoothed is None:
+                self._multi_dc_smoothed = multi_dc_raw
+            else:
+                self._multi_dc_smoothed = (
+                    self._multi_dc_alpha * multi_dc_raw
+                    + (1.0 - self._multi_dc_alpha) * self._multi_dc_smoothed
+                )
+            multi_dc = self._multi_dc_smoothed
+
+        # Compute target net battery charge current
+        ccl_inputs = [v for v in (user_ccl, bms_ccl) if v is not None]
+        target_net_charge = min(ccl_inputs) if ccl_inputs else None
+
+        # Apply mode
+        if target_net_charge is None:
+            active_ccl = None
+        elif self._mode == 'load_following':
+            active_ccl = -multi_dc + target_net_charge
+            # Huawei can't sink current — if formula goes negative it means
+            # Multi is charging hard enough by itself; we just sit at 0.
+            active_ccl = max(0.0, active_ccl)
+        else:  # 'simple'
+            active_ccl = max(0.0, target_net_charge)
+
+        # CVL — straight min, no Multi involvement
+        cvl_inputs = [v for v in (user_cvl, bms_cvl) if v is not None]
+        active_cvl = min(cvl_inputs) if cvl_inputs else None
+
+        # Safety: clamp CCL to [0, max], drop CVL outside [min, max]
+        if active_ccl is not None:
+            clamped = min(active_ccl, self._max_current)
+            if abs(clamped - active_ccl) > 1e-6:
+                logging.warning("DVCC CCL %.2f A clamped to %.2f A (safety cap %.1f A)",
+                                active_ccl, clamped, self._max_current)
+                active_ccl = clamped
+
+        if active_cvl is not None:
+            if not (self._min_voltage <= active_cvl <= self._max_voltage):
+                logging.warning("DVCC CVL %.2f V outside safety [%.2f..%.2f] — NOT publishing",
+                                active_cvl, self._min_voltage, self._max_voltage)
+                active_cvl = None
+
+        # Publish to ESPHome with hysteresis AND rate-limit:
+        #   - hysteresis: only publish if value moved by ≥ deadband
+        #   - rate-limit: never publish more often than min_publish_interval_s,
+        #     to give Multi+Huawei time to settle between commands and avoid
+        #     control-loop oscillation
+        now = time()
+        time_since_last = now - self._last_publish_time
+        rate_limited = time_since_last < self._min_publish_interval
+
+        if self._cmd_ccl and active_ccl is not None:
+            ccl_delta_ok = (self._last_published_ccl is None
+                            or abs(active_ccl - self._last_published_ccl) >= self._hysteresis_ccl)
+            if ccl_delta_ok and not rate_limited:
+                payload = "%.2f" % active_ccl
+                self._mqtt.publish(self._cmd_ccl, payload)
+                logging.info("DVCC → ESPHome: %s = %s A "
+                             "[mode=%s, user_ccl=%s, bms_ccl=%s, multi_dc_smoothed=%.2f, target_net=%s]",
+                             self._cmd_ccl, payload, self._mode,
+                             user_ccl, bms_ccl, multi_dc, target_net_charge)
+                self._last_published_ccl = active_ccl
+                self._last_publish_time = now
+
+        if self._cmd_cvl and active_cvl is not None:
+            cvl_delta_ok = (self._last_published_cvl is None
+                            or abs(active_cvl - self._last_published_cvl) >= self._hysteresis_cvl)
+            # voltage changes are rare and important — bypass rate-limit
+            if cvl_delta_ok:
+                payload = "%.2f" % active_cvl
+                self._mqtt.publish(self._cmd_cvl, payload)
+                logging.info("DVCC → ESPHome: %s = %s V [user_cvl=%s, bms_cvl=%s]",
+                             self._cmd_cvl, payload, user_cvl, bms_cvl)
+                self._last_published_cvl = active_cvl
+
+        # Mirror into our own /Link/* paths so Venus UI shows the active values
+        if active_ccl is not None:
+            charger_dict['/Link/ChargeCurrent']['value'] = active_ccl
+        if active_cvl is not None:
+            charger_dict['/Link/ChargeVoltage']['value'] = active_cvl
+        # NetworkMode = 0x0D (1 + 4 + 8): external control + external V + external I
+        charger_dict['/Link/NetworkMode']['value'] = 13
+        return True  # for GLib timer
+
+
 # ─────────────────────────── dbus service ───────────────────────────
 class DbusMqttChargerService:
     def __init__(self, servicename, deviceinstance, paths,
@@ -318,45 +602,12 @@ class DbusMqttChargerService:
 
     def _handlechangedvalue(self, path, value):
         """
-        Venus DVCC engine writes to /Link/ChargeCurrent and /Link/ChargeVoltage
-        when it wants to limit the charger. Forward those to ESPHome.
-        Also accept manual writes to /Mode (1=On, 4=Off) and /Settings paths.
+        DVCC forwarding is now done by DvccForwarder (Plan B), which reads
+        directly from com.victronenergy.settings and com.victronenergy.battery.aggregate.
+        Venus does NOT write to /Link/* on com.victronenergy.charger services,
+        so this handler only logs writes for debugging.
         """
-        logging.debug(f"dbus set {path} = {value}")
-
-        if not dvcc_enabled:
-            return True
-
-        if path == "/Link/ChargeCurrent" and self._cmd_dc_current:
-            try:
-                target = float(value)
-            except (TypeError, ValueError):
-                logging.warning(f"/Link/ChargeCurrent: cannot parse {value!r}")
-                return True
-            capped = max(0.0, min(target, dvcc_max_current_safety))
-            if capped != target:
-                logging.warning(f"DVCC ChargeCurrent {target} A capped to {capped} A (safety limit {dvcc_max_current_safety} A)")
-            payload = "%.2f" % capped
-            mqtt_client.publish(self._cmd_dc_current, payload)
-            logging.info(f"DVCC → ESPHome: {self._cmd_dc_current} = {payload} A")
-
-        elif path == "/Link/ChargeVoltage" and self._cmd_dc_voltage:
-            try:
-                target = float(value)
-            except (TypeError, ValueError):
-                logging.warning(f"/Link/ChargeVoltage: cannot parse {value!r}")
-                return True
-            if not (dvcc_min_voltage_safety <= target <= dvcc_max_voltage_safety):
-                logging.warning(f"DVCC ChargeVoltage {target} V outside safety [{dvcc_min_voltage_safety}, {dvcc_max_voltage_safety}] — IGNORING")
-                return True
-            payload = "%.2f" % target
-            mqtt_client.publish(self._cmd_dc_voltage, payload)
-            logging.info(f"DVCC → ESPHome: {self._cmd_dc_voltage} = {payload} V")
-
-        elif path == "/Link/NetworkMode":
-            # Venus toggling DVCC mode; just accept the value
-            pass
-
+        logging.debug("dbus set %s = %s", path, value)
         return True
 
 
@@ -450,6 +701,70 @@ def main():
         cmd_topic_dc_current=cmd_dc_current_topic,
         cmd_topic_dc_voltage=cmd_dc_voltage_topic,
     )
+
+    # ── Plan B: DVCC forwarder. Reads CCL/CVL from settings + aggregate BMS
+    # + MultiPlus DC current, computes load-following setpoint, publishes to ESPHome.
+    if dvcc_enabled and (cmd_dc_current_topic or cmd_dc_voltage_topic):
+        dvcc_section = config["DVCC"] if "DVCC" in config else {}
+        # Each source: (key, service_name, dbus_path)
+        dvcc_paths = [
+            (
+                "user_ccl",
+                dvcc_section.get("user_ccl_service", "com.victronenergy.settings"),
+                dvcc_section.get("user_ccl_path", "/Settings/SystemSetup/MaxChargeCurrent"),
+            ),
+            (
+                "user_cvl",
+                dvcc_section.get("user_cvl_service", "com.victronenergy.settings"),
+                dvcc_section.get("user_cvl_path", "/Settings/SystemSetup/MaxChargeVoltage"),
+            ),
+            (
+                "bms_ccl",
+                dvcc_section.get("bms_service", "com.victronenergy.battery.aggregate"),
+                dvcc_section.get("bms_ccl_path", "/Info/MaxChargeCurrent"),
+            ),
+            (
+                "bms_cvl",
+                dvcc_section.get("bms_service", "com.victronenergy.battery.aggregate"),
+                dvcc_section.get("bms_cvl_path", "/Info/MaxChargeVoltage"),
+            ),
+            (
+                "multiplus_dc",
+                dvcc_section.get("multiplus_service", "com.victronenergy.system"),
+                dvcc_section.get("multiplus_dc_path", "/Dc/Vebus/Current"),
+            ),
+        ]
+        heartbeat_s = int(dvcc_section.get("heartbeat_seconds", "30"))
+        mode = dvcc_section.get("mode", "load_following").strip()
+        if mode not in ("load_following", "simple"):
+            logging.warning("Unknown DVCC mode '%s', falling back to 'load_following'", mode)
+            mode = "load_following"
+        hysteresis_ccl = float(dvcc_section.get("hysteresis_ccl", "1.0"))
+        hysteresis_cvl = float(dvcc_section.get("hysteresis_cvl", "0.05"))
+        multi_dc_alpha = float(dvcc_section.get("multi_dc_ema_alpha", "0.25"))
+        min_publish_interval = float(dvcc_section.get("min_publish_interval_seconds", "2.0"))
+        DvccForwarder(
+            mqtt_client=mqtt_client,
+            cmd_topic_ccl=cmd_dc_current_topic,
+            cmd_topic_cvl=cmd_dc_voltage_topic,
+            paths=dvcc_paths,
+            max_current=dvcc_max_current_safety,
+            min_voltage=dvcc_min_voltage_safety,
+            max_voltage=dvcc_max_voltage_safety,
+            mode=mode,
+            hysteresis_ccl=hysteresis_ccl,
+            hysteresis_cvl=hysteresis_cvl,
+            multi_dc_ema_alpha=multi_dc_alpha,
+            min_publish_interval_s=min_publish_interval,
+            heartbeat_s=heartbeat_s,
+        )
+        logging.info("DVCC forwarder started (mode=%s, hysteresis_ccl=%.2f A, "
+                     "hysteresis_cvl=%.2f V, ema_alpha=%.2f, min_publish_interval=%.1fs, heartbeat=%ds)",
+                     mode, hysteresis_ccl, hysteresis_cvl,
+                     multi_dc_alpha, min_publish_interval, heartbeat_s)
+    else:
+        logging.info("DVCC forwarder NOT started (dvcc_control_enabled=%s, cmd topics: ccl=%s cvl=%s)",
+                     dvcc_enabled, cmd_dc_current_topic, cmd_dc_voltage_topic)
 
     logging.info("dbus registered, entering GLib MainLoop")
     GLib.MainLoop().run()
