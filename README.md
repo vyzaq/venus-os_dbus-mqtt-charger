@@ -182,3 +182,17 @@ If you see `dbus.exceptions.NameExistsException: Bus name already exists: com.vi
 ## Compatibility
 
 Tested approach mirrors the upstream solar-charger driver, which supports the latest three stable Venus OS releases.
+
+## Test Environment
+Convert to com.victronenergy.charger with DVCC load-following
+
+- Replace solarcharger service type with com.victronenergy.charger
+- Subscribe to ESPHome state topics (multi-topic, no JSON aggregation)
+- Plan B: DVCC forwarding via direct dbus subscription (Venus doesn't write
+  /Link/* on com.victronenergy.charger services)
+- Load-following formula: max(0, -multi_dc + min(user_ccl, bms_ccl))
+- ItemsChanged signal subscription (PropertiesChanged on per-path doesn't fire)
+- EMA smoothing (alpha=0.1) + hysteresis (2.0A) + rate-limiting (3s) for
+  feedback oscillation prevention with cyclic loads (heater+AC, fridge etc.)
+- Tested on Venus v3.72, MultiPlus-II 48/6k5, 2x JKBMS via dbus-serialbattery,
+  Dr-Gigavolt dbus-aggregate-batteries, Huawei R4875G1 via ESPHome
