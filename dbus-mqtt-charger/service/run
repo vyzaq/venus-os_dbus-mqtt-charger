@@ -1,4 +1,7 @@
 #!/bin/sh
-echo "*** starting dbus-mqtt-charger ***"
+trap 'kill -TERM $PID' TERM INT
 exec 2>&1
-exec python /data/etc/dbus-mqtt-charger/dbus-mqtt-charger.py
+python -u /data/etc/dbus-mqtt-charger/dbus-mqtt-charger.py &
+PID=$!
+wait $PID
+exit $?

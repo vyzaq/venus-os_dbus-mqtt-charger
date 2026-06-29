@@ -84,6 +84,8 @@ connected = 0          # MQTT broker connection state
 last_changed = 0       # last time any subscribed state arrived
 last_updated = 0       # last time dbus was synced from charger_dict
 mqtt_client = None     # set in main()
+_charger_offline = False    # True after timeout elapsed; service stays on dbus with zero values
+_need_offline_push = False  # one-shot: force a dbus push when transitioning to offline
 
 
 # ─────────────────────────── formatting ───────────────────────────
@@ -127,8 +129,8 @@ def _kwh(p, v):
 # /Mode: 1 = On, 4 = Off
 charger_dict = {
     "/NrOfOutputs": {"value": 1, "textformat": _n},
-    "/Dc/0/Voltage": {"value": None, "textformat": _v},
-    "/Dc/0/Current": {"value": None, "textformat": _a},
+    "/Dc/0/Voltage": {"value": 0.0, "textformat": _v},
+    "/Dc/0/Current": {"value": 0.0, "textformat": _a},
     "/Dc/0/Temperature": {"value": None, "textformat": _t},
     "/Mode": {"value": 1, "textformat": _n},
     "/State": {"value": 0, "textformat": _n},
@@ -183,6 +185,13 @@ def _handle_power_state(payload):
 _esphome_online = True  # assume online until LWT tells us otherwise
 
 
+def _zero_charger_measurements():
+    """Zero out measurement values when charger goes offline."""
+    charger_dict["/Dc/0/Voltage"]["value"] = 0.0
+    charger_dict["/Dc/0/Current"]["value"] = 0.0
+    charger_dict["/Dc/0/Temperature"]["value"] = None
+
+
 def _derive_state():
     """
     Choose /State value based on /Mode, current and DVCC NetworkMode.
@@ -191,6 +200,8 @@ def _derive_state():
     most accurate Victron state is 11 (Power supply) or 252 (External control)
     when DVCC is writing setpoints.
     """
+    if _charger_offline:
+        return 0  # Off when no MQTT data
     mode = charger_dict["/Mode"]["value"]
     if mode == 4:
         return 0  # Off
@@ -563,10 +574,22 @@ class DbusMqttChargerService:
         GLib.timeout_add(1000, self._update)
 
     def _update(self):
-        global last_changed, last_updated
+        global last_changed, last_updated, _charger_offline, _need_offline_push
         now = int(time())
 
-        if last_changed != last_updated:
+        timed_out = timeout != 0 and (now - last_changed) > timeout
+
+        if timed_out and not _charger_offline:
+            logging.warning("No MQTT data for %i s — charger offline, holding zero values on dbus.", timeout)
+            _charger_offline = True
+            _need_offline_push = True
+            _zero_charger_measurements()
+        elif not timed_out and _charger_offline:
+            _charger_offline = False
+            logging.info("MQTT data resumed after offline period.")
+
+        if last_changed != last_updated or _need_offline_push:
+            _need_offline_push = False
             # Derive /State from current snapshot
             charger_dict["/State"]["value"] = _derive_state()
 
@@ -578,22 +601,18 @@ class DbusMqttChargerService:
                     et, eo, etb = sys.exc_info()
                     logging.error(f"dbus set {path}={data['value']} failed: {repr(eo)} in {etb.tb_frame.f_code.co_filename}:{etb.tb_lineno}")
 
-            # /Connected from ESPHome LWT
-            self._dbusservice["/Connected"] = 1 if _esphome_online else 0
+            # /Connected: timeout or ESPHome LWT "offline" → 0
+            self._dbusservice["/Connected"] = 0 if (_charger_offline or not _esphome_online) else 1
 
             v = charger_dict["/Dc/0/Voltage"]["value"] or 0
             i = charger_dict["/Dc/0/Current"]["value"] or 0
-            logging.info("Charger: {:.2f} V × {:.2f} A = {:.0f} W (state={}, mode={})".format(
+            logging.info("Charger: {:.2f} V × {:.2f} A = {:.0f} W (state={}, mode={}, offline={})".format(
                 v, i, v * i,
                 charger_dict["/State"]["value"],
-                charger_dict["/Mode"]["value"]))
+                charger_dict["/Mode"]["value"],
+                _charger_offline))
 
             last_updated = last_changed
-
-        # No data for too long → die so daemontools restarts us
-        if timeout != 0 and (now - last_changed) > timeout:
-            logging.error("No MQTT data for %i s — exiting." % timeout)
-            sys.exit()
 
         # UpdateIndex tick
         idx = (self._dbusservice["/UpdateIndex"] + 1) & 0xFF
@@ -674,21 +693,11 @@ def main():
         mqtt_client.username_pw_set(username=user, password=pwd)
 
     logging.info(f"MQTT: connecting to {config['MQTT']['broker_address']}:{config['MQTT']['broker_port']}")
-    mqtt_client.connect(host=config["MQTT"]["broker_address"], port=int(config["MQTT"]["broker_port"]))
     mqtt_client.loop_start()
-
-    # Wait for first DC current reading (the one we really need for accounting)
-    i = 0
-    while charger_dict["/Dc/0/Current"]["value"] is None:
-        if i % 12 == 0 and i > 0:
-            logging.warning("Still waiting for first /Dc/0/Current after %d s..." % (i * 5))
-        else:
-            logging.info("Waiting for first /Dc/0/Current MQTT message...")
-        if timeout != 0 and timeout <= (i * 5):
-            logging.error("No MQTT data within %d s — exiting." % timeout)
-            sys.exit()
-        sleep(5)
-        i += 1
+    try:
+        mqtt_client.connect(host=config["MQTT"]["broker_address"], port=int(config["MQTT"]["broker_port"]))
+    except Exception as err:
+        logging.warning(f"MQTT: initial connect failed ({err}), will retry in background via on_disconnect")
 
     paths_dbus = {"/UpdateIndex": {"value": 0, "textformat": _n}}
     paths_dbus.update(charger_dict)
