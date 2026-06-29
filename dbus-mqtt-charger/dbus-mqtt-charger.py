@@ -8,16 +8,10 @@
 #   READ:  subscribes to multiple ESPHome MQTT state topics (one per sensor,
 #          ESPHome's default behaviour) and republishes the data on dbus as
 #          a com.victronenergy.charger service.
-#   WRITE: implements DVCC forwarding via Plan B — listens on the SystemBus
-#          for changes to:
-#              com.victronenergy.settings/Settings/SystemSetup/MaxChargeCurrent
-#              com.victronenergy.settings/Settings/SystemSetup/MaxChargeVoltage
-#              com.victronenergy.battery.aggregate/Info/MaxChargeCurrent
-#              com.victronenergy.battery.aggregate/Info/MaxChargeVoltage
-#          On any change, takes min(user, bms) and publishes the resulting
-#          setpoint to ESPHome via the configured command topics. This is
-#          needed because Venus DVCC does not write to /Link/* on
-#          com.victronenergy.charger services (only on solarchargers).
+#   WRITE: _handlechangedvalue forwards /Link/ChargeCurrent and
+#          /Link/ChargeVoltage written by Venus DVCC to ESPHome via MQTT.
+#          Optional Plan B DvccForwarder (dvcc_control_enabled=1) adds
+#          load-following logic; disable it if Venus DVCC is sufficient.
 #
 # Forked from mr-manuel/venus-os_dbus-mqtt-solar-charger.
 
